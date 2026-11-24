@@ -66,7 +66,7 @@ if(AUTOREVERBPRO_BUILD_TEST)
     juce_add_console_app(AutoReverbProTest PRODUCT_NAME "AutoReverbProTest")
     target_sources(AutoReverbProTest PRIVATE Test/Main.cpp ${AUTOREVERBPRO_SOURCES})
     target_compile_definitions(AutoReverbProTest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1
-        AUTOREVERBPRO_TEST=1 JucePlugin_VersionString="1.0.0")
+        AUTOREVERBPRO_TEST=1 JucePlugin_VersionString="1.0.0" JUCE_MODAL_LOOPS_PERMITTED=1)
     target_compile_features(AutoReverbProTest PRIVATE cxx_std_17)
     target_link_libraries(AutoReverbProTest PRIVATE AutoReverbProData juce::juce_audio_utils juce::juce_dsp juce::juce_recommended_config_flags)
 endif()

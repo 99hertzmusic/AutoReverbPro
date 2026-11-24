@@ -41,6 +41,7 @@ class ProPanel : public juce::Component
 public:
     explicit ProPanel (AutoReverbProAudioProcessor& p);
     void show (const juce::String& reason);
+    void licenceChanged();   // the processor's licence changed (another instance, trial expiry): redraw if open
     void paint (juce::Graphics&) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent& e) override;   // click outside the card closes it
@@ -54,7 +55,7 @@ private:
     juce::TextEditor emailBox, keyBox;
     juce::ToggleButton subscribe { "Send me tips and offers" };
     juce::TextButton trialButton { "START 7-DAY FREE TRIAL" }, unlockButton { "UNLOCK" },
-                     buyButton { "BUY PRO" }, closeButton { "CLOSE" };
+                     buyButton { "UPGRADE" }, closeButton { "CLOSE" };
 };
 
 // The hero: the decay envelope against a beat grid (it ends on the beat), the real tail after the
@@ -107,6 +108,8 @@ private:
     juce::Rectangle<int> ledArea, meterArea, secSpace, secAuto, secPro, secOut;
     juce::String ledLabel, ledText, ledRightLabel, ledRightText;
     float mIn = 0.0f, mWet = 0.0f, mDuck = 0.0f;
+    bool upgradeNudge = false;
+    int seenLicenceVersion = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AutoReverbProAudioProcessorEditor)
 };

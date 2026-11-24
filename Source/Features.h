@@ -28,7 +28,7 @@ inline const char* preStepName (int i)
 }
 
 // Fixed values Lite runs with.
-inline constexpr float liteDuck  = 50.0f;    // %  (100 % = 18 dB of ducking at full input level)
+inline constexpr float liteDuck  = 25.0f;    // %  (100 % = 18 dB of ducking at full input level; Lite = a gentle 4.5 dB)
 inline constexpr float liteTone  = 50.0f;    // %  (the space's own voicing)
 inline constexpr float liteWidth = 100.0f;   // %
 inline constexpr float maxDuckDb = 18.0f;

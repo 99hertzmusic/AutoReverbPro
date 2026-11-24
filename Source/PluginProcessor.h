@@ -47,7 +47,11 @@ public:
     hz::Licence licence { "autoreverbpro" };
     hz::LicenceInfo licenceInfo;                 // message thread
     std::atomic<bool> proUnlocked { false };     // audio thread reads this
-    void setLicenceInfo (const hz::LicenceInfo& i) { licenceInfo = i; proUnlocked.store (i.unlocked()); }
+    std::atomic<int> licenceVersion { 0 };       // bumps on every change, so open editors can follow
+    void setLicenceInfo (const hz::LicenceInfo& i) { licenceInfo = i; proUnlocked.store (i.unlocked()); ++licenceVersion; }
+    std::unique_ptr<hz::LicenceWatcher> licenceWatcher;   // picks up keys saved by other instances / trial expiry
+    // True if the current settings include upgrade-only values (kept in the session, played as free).
+    bool usesUpgradeSettings() const;
 
     // ── What actually runs, after the Lite/Pro gate and AUTO are resolved ───
     struct Effective
@@ -63,7 +67,7 @@ public:
         float sizeScale = 1.0f, hfRatio = 0.5f, outLpHz = 10000.0f;
     };
     Effective resolve (bool pro, double bpm) const;
-    static int autoDecayStep (int space, float size01);
+    static int autoDecayStep (int space, float size01, double bpm);
     static inline float rtOverride = 0.0f;        // test hook: force the engine RT60 (calibration)
     static inline float rtFitRatio = 0.35f;       // longest line <= this x RT60
 
@@ -100,7 +104,7 @@ private:
     int preCur = 0, prePrev = 0; float preFade = 1.0f, preFadeStep = 0.001f;
 
     // Ducking + hit detection on the dry input.
-    float duckEnv = 0.0f, duckPeakDb = -100.0f, duckGr = 0.0f;
+    float duckMs = 0.0f, duckRefDb = -100.0f, duckGr = 0.0f, duckSus = 0.0f;
     float onFast = 0.0f, onSlow = 0.0f;
     double since = 1.0e9;              // samples since the last hit
     double revSince = 1.0e9;           // samples since the current REVERSE swell started

@@ -6,8 +6,8 @@
 //         -> orthogonal L/R taps (+ the diffuser as early sound) -> tone high cut
 //   SHIMMER adds an octave-up pitch shifter inside the loop.
 //
-// Decay is exact by construction: every line loses 60 dB per RT60 seconds at DC, and HF loses it
-// faster (RT60 * hfRatio), set by a one-pole filter whose DC and Nyquist gains are solved directly.
+// Decay is exact by construction: every line loses 60 dB per RT60 seconds below dampHz, and above it
+// faster (RT60 * hfRatio), set by a passive one-pole shelf whose two gains are solved directly.
 #include <cmath>
 #include <vector>
 #include <array>
@@ -22,6 +22,7 @@ namespace ar
 inline constexpr int N = 16;
 inline constexpr int numDiffStages = 4;
 inline constexpr float pi = 3.14159265358979f;
+inline constexpr float wetMakeupDb = 4.0f;   // all spaces: MIX 100 % sits near the dry's loudness, like the big-name reverbs
 
 // How each space is voiced. Times in ms at SIZE 50 %.
 struct Voice
@@ -29,12 +30,14 @@ struct Voice
     float lineMinMs, lineMaxMs;   // FDN line lengths (spread exponentially between these)
     float diffMs;                 // diffuser length (all 4 stages)
     float erGain;                 // diffuser sent straight out (early sound)
-    float modMs, modHz;           // delay modulation depth / rate (kills metallic modes)
-    float hfRatio;                // RT60 at the top / RT60 at DC, at TONE 50 %
+    float modMs, modHz;           // delay modulation depth / rate (chorus in the tail, kills metallic modes)
+    float hfRatio;                // RT60 above dampHz / RT60 below it, at TONE 50 %
+    float dampHz;                 // where the tail's high-frequency damping starts (air / plate absorption)
     float outLpHz;                // output high cut at TONE 50 %
     float lowCutHz;               // built-in low cut on the reverb (24 dB/oct)
     float outGainDb;              // level match between spaces
-    int   autoDecay;              // AUTO decay at SIZE 50 %: index into decayStepsBeats
+    float autoSec;                // AUTO length (tail -60 dB) at SIZE 50 %, snapped to the nearest beat step; 0 = autoDecay
+    int   autoDecay;              // GATED / REVERSE AUTO length: index into decayStepsBeats
     int   autoPre;                // AUTO pre-delay: index into preStepsBeats
     float rtMul;                  // GATED / REVERSE: engine RT60 = rtMul * gate length
     float shimmer;                // octave-up feedback amount
@@ -44,16 +47,17 @@ struct Voice
 
 inline const Voice& voice (int s)
 {
+    // AUTO lengths follow what engineers reach for: rooms ~1 s, plates ~2 s, halls ~3 s, shimmer washes ~5 s.
     static const Voice v[numSpaces] = {
-        //  min   max  diff   er    mod   hz    hf    lp      lowcut gain aDec aPre rtMul shim  spring shape
-        {   7,   34,  12, 0.55f, 0.12f, 0.45f, 0.45f,  9000, 200, 2.5f, 2, 1, 1, 0.0f, 0.0f, 0 },   // ROOM     1 beat,  1/64
-        {   9,   40,  16, 0.20f, 0.30f, 0.80f, 0.70f, 12000, 220, 0.0f, 3, 2, 1, 0.0f, 0.0f, 0 },   // PLATE    2 beats, 1/32
-        {  20,  105,  32, 0.30f, 0.45f, 0.33f, 0.40f,  8000, 160, 0.0f, 4, 2, 1, 0.0f, 0.0f, 0 },   // HALL     4 beats, 1/32
-        {  14,   60,  22, 0.45f, 0.22f, 0.50f, 0.50f,  8000, 180, 1.5f, 3, 1, 1, 0.0f, 0.0f, 0 },   // CHAMBER  2 beats, 1/64
-        {  14,   48,  14, 0.15f, 0.18f, 0.60f, 0.55f,  4800, 260, 0.5f, 3, 1, 1, 0.0f, 0.6f, 0 },   // SPRING   2 beats, 1/64
-        {  22,  115,  34, 0.25f, 0.55f, 0.30f, 0.55f, 10000, 250, -2.5f, 5, 2, 1, 0.5f, 0.0f, 0 },   // SHIMMER  8 beats, 1/32
-        {   8,   36,  12, 0.50f, 0.15f, 0.50f, 0.60f, 10000, 200, 1.5f, 1, 0, 3, 0.0f, 0.0f, 1 },   // GATED    1/2 beat, off
-        {  14,   66,  24, 0.00f, 0.30f, 0.50f, 0.55f, 10000, 200, 6.0f, 2, 0, 4, 0.0f, 0.0f, 2 },   // REVERSE  1 beat,  off
+        //  min   max  diff   er    mod   hz    hf    damp   lp     lowcut gain  aSec aDec aPre rtMul shim  spring shape
+        {   7,   34,  12, 0.55f, 0.12f, 0.45f, 0.55f, 4500,  9000, 140, 2.5f, 1.1f, 2, 1, 1, 0.0f, 0.0f, 0 },   // ROOM
+        {   9,   40,  16, 0.45f, 0.18f, 0.80f, 0.50f, 5000,  9500, 160, 0.0f, 1.9f, 3, 1, 1, 0.0f, 0.0f, 0 },   // PLATE
+        {  20,  105,  32, 0.55f, 0.30f, 0.33f, 0.40f, 3500,  8000, 160, 0.0f, 3.2f, 4, 1, 1, 0.0f, 0.0f, 0 },   // HALL
+        {  14,   60,  22, 0.45f, 0.18f, 0.50f, 0.45f, 4000,  8000, 150, 1.5f, 1.6f, 3, 1, 1, 0.0f, 0.0f, 0 },   // CHAMBER
+        {  14,   48,  14, 0.15f, 0.18f, 0.60f, 0.55f, 4000,  4800, 200, 0.5f, 2.0f, 3, 1, 1, 0.0f, 0.6f, 0 },   // SPRING
+        {  22,  115,  34, 0.25f, 0.55f, 0.30f, 0.50f, 5000, 10000, 200, 0.0f, 3.8f, 5, 2, 1, 0.5f, 0.0f, 0 },   // SHIMMER
+        {   8,   36,  12, 0.50f, 0.15f, 0.50f, 0.60f, 5000, 10000, 160, 3.0f, 0.0f, 1, 0, 3, 0.0f, 0.0f, 1 },   // GATED    1/2 beat
+        {  14,   66,  24, 0.00f, 0.30f, 0.50f, 0.55f, 5000, 10000, 160, 9.0f, 0.0f, 2, 0, 4, 0.0f, 0.0f, 2 },   // REVERSE  1 beat
     };
     return v[s >= 0 && s < numSpaces ? s : 0];
 }
@@ -276,8 +280,8 @@ public:
             const float c = mc[i], s = ms[i];
             mc[i] = c * mcw[i] - s * msw[i]; ms[i] = s * mcw[i] + c * msw[i];
             y[i] = fdn[i].tapFrac (std::max (2.0f, lenCur[i] + modDepth * s - 1.0f));
-            lp[i] = b0[i] * y[i] + a1[i] * lp[i];
-            z[i] = lp[i];
+            lp[i] += dampC * (y[i] - lp[i]);                  // split at dampHz: lows decay at RT60, highs faster
+            z[i] = gLo[i] * lp[i] + gHi[i] * (y[i] - lp[i]);
         }
         householder (z);
 
@@ -344,8 +348,7 @@ private:
             float g  = std::exp (-6.9078f * lenCur[i] / (rt * fs));
             float gn = std::exp (-6.9078f * lenCur[i] / (rt * hfCur * fs));
             g += (1.0f - g) * frz; gn += (1.0f - gn) * frz;
-            a1[i] = (g - gn) / (g + gn);
-            b0[i] = g * (1.0f - a1[i]);
+            gLo[i] = g; gHi[i] = gn;
         }
         spFb = std::min (0.55f, std::exp (-6.9078f * 0.05f / rt));   // the drip never outlasts the tail
         spDFit = std::max (8.0f, std::min (spD, 0.12f * rt * fs));     // short tails: a shorter spring
@@ -357,17 +360,18 @@ private:
         inTarget = t.input * (1.0f - frz);
         const auto& v = voice (space);
         erGain = v.erGain;
-        outGain = std::pow (10.0f, v.outGainDb / 20.0f);
+        dampC = 1.0f - std::exp (-2.0f * pi * std::min (v.dampHz, 0.4f * fs) / fs);
+        outGain = std::pow (10.0f, (v.outGainDb + wetMakeupDb) / 20.0f);
         inK = 1.0f - std::exp (-1.0f / (0.012f * fs));
-        sizeK = 1.0f - std::exp (-1.0f / (0.25f * fs));
+        sizeK = 1.0f - std::exp (-1.0f / (0.4f * fs));   // slow glide: no zipper / Doppler grit when SIZE jumps
     }
 
     float fs = 48000.0f;
     std::array<Line, N> fdn;
     std::array<Stage, numDiffStages> diff;
     float base[N] {}, lenCur[N] {}, lenTarget[N] {}, mc[N] {}, ms[N] {}, mcw[N] {}, msw[N] {};
-    float lp[N] {}, a1[N] {}, b0[N] {}, inSign[N] {}, shSign[N] {}, oL[N] {}, oR[N] {};
-    float modDepth = 0.0f, rtLog = 0.0f, frz = 0.0f, hfCur = 0.5f, lpCur = -1.0f, erGain = 0.0f, outGain = 1.0f;
+    float lp[N] {}, gLo[N] {}, gHi[N] {}, inSign[N] {}, shSign[N] {}, oL[N] {}, oR[N] {};
+    float dampC = 0.3f, modDepth = 0.0f, rtLog = 0.0f, frz = 0.0f, hfCur = 0.5f, lpCur = -1.0f, erGain = 0.0f, outGain = 1.0f;
     float inGain = 0.0f, inK = 0.001f, sizeK = 0.0001f;
     int counter = 0;
     Svf lowCut[2][2], tone[2];

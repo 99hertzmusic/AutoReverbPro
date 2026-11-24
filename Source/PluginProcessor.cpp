@@ -19,6 +19,20 @@ AutoReverbProAudioProcessor::AutoReverbProAudioProcessor()
     pWidth  = apvts.getRawParameterValue ("width");
     pFreeze = apvts.getRawParameterValue ("freeze");
     setLicenceInfo (licence.check());
+    licenceWatcher = std::make_unique<hz::LicenceWatcher> (licence, licenceInfo, [this] (const hz::LicenceInfo& i) { setLicenceInfo (i); });
+}
+
+bool AutoReverbProAudioProcessor::usesUpgradeSettings() const
+{
+    using namespace ar;
+    auto differs = [] (float v, float lite) { return std::abs (v - lite) > 0.05f; };
+    return ! gate::spaceAllowed ((int) pSpace->load(), false)
+        || (gate::proDecay    && (int) pDecay->load() != 0)
+        || (gate::proPreDelay && (int) pPre->load() != 0)
+        || (gate::proDuck     && differs (pDuck->load(),  liteDuck))
+        || (gate::proTone     && differs (pTone->load(),  liteTone))
+        || (gate::proWidth    && differs (pWidth->load(), liteWidth))
+        || (gate::proFreeze   && pFreeze->load() > 0.5f);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout AutoReverbProAudioProcessor::createParameterLayout()
@@ -45,11 +59,24 @@ juce::AudioProcessorValueTreeState::ParameterLayout AutoReverbProAudioProcessor:
 }
 
 // ── Resolve: Lite/Pro gate + AUTO -> the numbers that actually run ────────────
-int AutoReverbProAudioProcessor::autoDecayStep (int space, float size01)
+int AutoReverbProAudioProcessor::autoDecayStep (int space, float size01, double bpm)
 {
-    // SIZE 50 % = the space's own length; every 25 % either side = one step (x2 or /2).
-    const int shift = (int) std::floor ((size01 * 100.0f - 50.0f) / 25.0f + 0.5f);
-    return juce::jlimit (0, ar::numDecaySteps - 1, ar::voice (space).autoDecay + shift);
+    const auto& v = ar::voice (space);
+    if (v.autoSec <= 0.0f)
+    {
+        // GATED / REVERSE: a beat length is the effect. SIZE 50 % = the space's own; every 25 % either side = one step.
+        const int shift = (int) std::floor ((size01 * 100.0f - 50.0f) / 25.0f + 0.5f);
+        return juce::jlimit (0, ar::numDecaySteps - 1, v.autoDecay + shift);
+    }
+    // Natural spaces: a musical length for the space (x0.5 at SIZE 0 %, x2 at 100 %), snapped to the nearest beat step.
+    const double want = v.autoSec * std::pow (2.0, (size01 - 0.5) * 2.0) / (ar::beatMs (bpm) / 1000.0);
+    int best = 0; double bestD = 1.0e9;
+    for (int k = 0; k < ar::numDecaySteps; ++k)
+    {
+        const double d = std::abs (std::log2 (ar::decayStepsBeats[k] / want));
+        if (d < bestD - 1.0e-9) { bestD = d; best = k; }
+    }
+    return best;
 }
 
 AutoReverbProAudioProcessor::Effective AutoReverbProAudioProcessor::resolve (bool pro, double bpm) const
@@ -64,7 +91,7 @@ AutoReverbProAudioProcessor::Effective AutoReverbProAudioProcessor::resolve (boo
 
     const int d = (pro || ! gate::proDecay) ? (int) pDecay->load() : 0;
     e.decayAuto  = d <= 0 || d > numDecaySteps;
-    e.decayStep  = e.decayAuto ? autoDecayStep (e.space, e.size) : d - 1;
+    e.decayStep  = e.decayAuto ? autoDecayStep (e.space, e.size, e.bpm) : d - 1;
     e.decayBeats = decayStepsBeats[e.decayStep];
 
     const int p = (pro || ! gate::proPreDelay) ? (int) pPre->load() : 0;
@@ -124,7 +151,7 @@ void AutoReverbProAudioProcessor::prepareToPlay (double sampleRate, int)
     s.state = active; s.outGain = 1.0f;
     preCur = prePrev = (int) std::lround (e.preSec * sampleRate); preFade = 1.0f;
 
-    duckEnv = 0.0f; duckPeakDb = -100.0f; duckGr = 0.0f; onFast = onSlow = 0.0f;
+    duckMs = 0.0f; duckRefDb = -100.0f; duckGr = 0.0f; duckSus = 0.0f; onFast = onSlow = 0.0f;
     since = revSince = 1.0e9; gateEnv = revEnv = 0.0f; shapeBypass = e.freeze ? 1.0f : 0.0f;
     sMix.reset (sampleRate, 0.05);   sMix.setCurrentAndTargetValue (e.mix);
     sWidth.reset (sampleRate, 0.05); sWidth.setCurrentAndTargetValue (e.width);
@@ -209,15 +236,22 @@ void AutoReverbProAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
     sMix.setTargetValue (e.mix);
     sWidth.setTargetValue (e.width);
 
-    // Ducking: full depth while the input is near its recent peak, gone within ~1/8 note of a gap.
+    // Ducking: a gentle dip while the source is sustained and loud, back up smoothly when it stops.
+    // RMS detection, and it only goes full depth once the source has stayed loud for ~250 ms: a vocal line
+    // or a held chord ducks the tail, single drum hits barely move it (no pumping on every transient).
+    // Release is program dependent: slow while the source keeps playing (no pumping between hits),
+    // quick (tempo-tied) once the source has really stopped, so the tail blooms in the gaps.
     sDuck.setTargetValue (e.duck * ar::maxDuckDb);
     const double beatSec = 60.0 / e.bpm;
-    const float tauRel = (float) juce::jlimit (0.02, 0.15, beatSec / 8.0);
-    const float kAtk = 1.0f - std::exp (-1.0f / (0.001f * (float) sr)), kRel = 1.0f - std::exp (-1.0f / (tauRel * (float) sr));
-    const float kGrA = 1.0f - std::exp (-1.0f / (0.005f * (float) sr)), kGrR = 1.0f - std::exp (-1.0f / (0.03f * (float) sr));
-    const float peakFall = 6.0f / (float) sr;
-    const float kFastA = 1.0f - std::exp (-1.0f / (0.0005f * (float) sr)), kFastR = 1.0f - std::exp (-1.0f / (0.02f * (float) sr));
-    const float kSlow  = 1.0f - std::exp (-1.0f / (0.04f * (float) sr));
+    const float fsf = (float) sr;
+    const float kMsA = 1.0f - std::exp (-1.0f / (0.010f * fsf)), kMsR = 1.0f - std::exp (-1.0f / (0.040f * fsf));
+    const float refFall = 4.0f / fsf;                                         // dB per sample (4 dB/s)
+    const float kGrA = 1.0f - std::exp (-1.0f / (0.035f * fsf));
+    const float kGrSlow = 1.0f - std::exp (-1.0f / ((float) juce::jlimit (0.15, 0.40, 0.5 * beatSec) * fsf));
+    const float kGrFast = 1.0f - std::exp (-1.0f / ((float) juce::jlimit (0.04, 0.12, beatSec / 8.0) * fsf));
+    const float susFull = 0.25f * fsf;                                        // loud this long = sustained
+    const float kFastA = 1.0f - std::exp (-1.0f / (0.0005f * fsf)), kFastR = 1.0f - std::exp (-1.0f / (0.02f * fsf));
+    const float kSlow  = 1.0f - std::exp (-1.0f / (0.04f * fsf));
     const double holdoff = 0.25 * beatSec * sr;
     const float shapeK = 1.0f - std::exp (-1.0f / (0.003f * (float) sr));
     const float bypK = 1.0f - std::exp (-1.0f / (0.05f * (float) sr));
@@ -248,12 +282,17 @@ void AutoReverbProAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
         }
 
         // Ducking
-        duckEnv += (x - duckEnv) * (x > duckEnv ? kAtk : kRel);
-        const float envDb = 20.0f * std::log10 (duckEnv + 1.0e-9f);
-        duckPeakDb = juce::jmax (envDb, juce::jmax (-70.0f, duckPeakDb - peakFall));
-        const float amt = envDb < -60.0f ? 0.0f : juce::jlimit (0.0f, 1.0f, (envDb - duckPeakDb + 20.0f) / 14.0f);
+        duckMs += (x * x - duckMs) * (x * x > duckMs ? kMsA : kMsR);
+        const float envDb = 10.0f * std::log10 (duckMs + 1.0e-12f);
+        duckRefDb = juce::jmax (envDb, juce::jmax (-60.0f, duckRefDb - refFall));
+        float amt = juce::jlimit (0.0f, 1.0f, (envDb - duckRefDb + 18.0f) / 12.0f);   // 0 at 18 dB under the recent level, 1 within 6 dB
+        duckSus = envDb > duckRefDb - 12.0f ? juce::jmin (susFull, duckSus + 1.0f) : juce::jmax (0.0f, duckSus - 2.0f);
+        const float sus = duckSus / susFull;
+        amt *= sus * sus * (3.0f - 2.0f * sus);
+        amt = envDb < -55.0f ? 0.0f : amt * amt * (3.0f - 2.0f * amt);
         const float grT = amt * sDuck.getNextValue();
-        duckGr += (grT - duckGr) * (grT > duckGr ? kGrA : kGrR);
+        const bool stopped = 20.0f * std::log10 (onFast + 1.0e-9f) < duckRefDb - 30.0f;   // the source has really gone quiet
+        duckGr += (grT - duckGr) * (grT > duckGr ? kGrA : (stopped ? kGrFast : kGrSlow));
         const float duckG = std::pow (10.0f, -duckGr / 20.0f);
 
         // GATED: open until the end, closing over the last bit. REVERSE: swells up to the end, then cuts.

@@ -3,7 +3,9 @@
 //        AutoReverbProTest demos <outdir> <bpm> file.wav ...   (every space on each file)
 //        AutoReverbProTest levels file.wav <bpm>               (wet loudness of each space)
 //        AutoReverbProTest calib-table                         (re-measure Source/Calibration.h)
-//  - the tail ends on the chosen beat (EDC / T30 fit, 500 Hz-2 kHz) at several tempos, Lite AUTO too
+//        AutoReverbProTest duck                                (only the ducking tests)
+//  - the tail is 60 dB down on the chosen beat (EDC / T30 fit, 500 Hz-2 kHz) at several tempos, Lite AUTO too
+//  - AUTO picks a musical length per space (room ~1 s, plate ~2 s, hall ~3 s ...) snapped to the nearest beat step
 //  - pre-delay exact, echo density builds fast (normalised echo density), no ringing modes,
 //    stereo decorrelation, low cut, ducking depth during input vs gaps, GATED / REVERSE end on the beat
 //  - freeze stable, shimmer never runs away, no clicks on any change, CPU per block
@@ -13,6 +15,7 @@
 #include "../Source/PluginProcessor.h"
 #include "../Source/PluginEditor.h"
 #include "../Source/Calibration.h"
+#include "LicenceTests.h"
 #include <cmath>
 #include <chrono>
 #include <complex>
@@ -175,7 +178,7 @@ static void decayTests()
         for (float size : { 0.0f, 25.0f, 50.0f, 75.0f, 100.0f })
             for (double bpm : { 100.0, 128.0 })
             {
-                const int stepIdx = APP::autoDecayStep (s, size / 100.0f);
+                const int stepIdx = APP::autoDecayStep (s, size / 100.0f, bpm);
                 const double target = ar::decayStepsBeats[stepIdx] * 60.0 / bpm;
                 const auto f = fitEnd (bandEnergy (ir (s, bpm, 0, 0, target * 1.4 + 0.6, hz::LicenceInfo::pro, size)));
                 Rig r (hz::LicenceInfo::none, bpm);
@@ -189,6 +192,22 @@ static void decayTests()
                              ar::spaceName (s), size, bpm, (double) ar::decayStepsBeats[stepIdx], target * 1000, f.endSec * 1000, err * 100, fl.endSec * 1000);
                 check (std::abs (err) < 0.10, juce::String ("AUTO ") + ar::spaceName (s) + " size " + juce::String (size, 0) + " @" + juce::String (bpm, 0) + " within 10 %");
             }
+
+    std::printf ("\n== AUTO picks a musical length for the space, snapped to a beat step (SIZE 50 %%) ==\n");
+    for (int s : { ar::room, ar::plate, ar::hall, ar::chamber, ar::spring, ar::shimmer })
+    {
+        std::printf ("  %-8s want ~%.1f s:", ar::spaceName (s), (double) ar::voice (s).autoSec);
+        for (double bpm : { 90.0, 120.0, 128.0, 140.0, 174.0 })
+        {
+            Rig r (hz::LicenceInfo::pro, bpm);
+            setParam (*r.p, "space", (float) s);
+            const auto e = r.p->resolve (true, bpm);
+            std::printf ("  %3.0f BPM %g beats = %.2f s", bpm, (double) e.decayBeats, (double) e.endSec);
+            const double ratio = e.endSec / ar::voice (s).autoSec;
+            check (ratio > 0.70 && ratio < 1.42, juce::String (ar::spaceName (s)) + " @" + juce::String (bpm, 0) + " AUTO within half a step of its musical length");
+        }
+        std::printf ("\n");
+    }
 
     std::printf ("\n== GATED / REVERSE stop on the beat (level 30 ms after the end vs peak) ==\n");
     for (int s : { ar::gated, ar::reverse })
@@ -347,20 +366,26 @@ static void densityRingingStereo()
 // ── Low cut ──────────────────────────────────────────────────────────────────
 static double wetRmsSine (int space, double hz)
 {
-    Rig r (hz::LicenceInfo::pro, 120.0);
-    setParam (*r.p, "space", (float) space); setParam (*r.p, "mix", 100.0f); setParam (*r.p, "duck", 0.0f);
-    r.reprepare();
-    const int len = (int) (3.0 * SR);
-    Buf s (2, len);
-    for (int i = 0; i < len; ++i) { const float v = 0.3f * (float) std::sin (twoPi * hz * i / SR); s.setSample (0, i, v); s.setSample (1, i, v); }
-    const auto o = run (*r.p, s, len, 0, false);
-    double sq = 0; for (int c = 0; c < 2; ++c) for (int i = (int) (1.5 * SR); i < len; ++i) sq += o.getSample (c, i) * o.getSample (c, i);
-    return 10.0 * std::log10 (sq / (2.0 * (len - 1.5 * SR)) + 1e-30);
+    // Average of three steady tones (hz x 0.9 / 1 / 1.1): one sine alone can land on a room mode or between two.
+    double tot = 0;
+    for (double f : { 0.9 * hz, hz, 1.1 * hz })
+    {
+        Rig r (hz::LicenceInfo::pro, 120.0);
+        setParam (*r.p, "space", (float) space); setParam (*r.p, "mix", 100.0f); setParam (*r.p, "duck", 0.0f);
+        r.reprepare();
+        const int len = (int) (3.0 * SR);
+        Buf s (2, len);
+        for (int i = 0; i < len; ++i) { const float v = 0.3f * (float) std::sin (twoPi * f * i / SR); s.setSample (0, i, v); s.setSample (1, i, v); }
+        const auto o = run (*r.p, s, len, 0, false);
+        double sq = 0; for (int c = 0; c < 2; ++c) for (int i = (int) (1.5 * SR); i < len; ++i) sq += o.getSample (c, i) * o.getSample (c, i);
+        tot += sq / (2.0 * (len - 1.5 * SR));
+    }
+    return 10.0 * std::log10 (tot / 3.0 + 1e-30);
 }
 
 static void lowCutTests()
 {
-    std::printf ("\n== Built-in low cut (steady sine, wet only, vs 1 kHz) ==\n");
+    std::printf ("\n== Built-in low cut (steady tones +-10 %%, wet only, vs 1 kHz) ==\n");
     for (int s : { ar::room, ar::plate, ar::hall })
     {
         const double k1 = wetRmsSine (s, 1000.0), h50 = wetRmsSine (s, 50.0), h100 = wetRmsSine (s, 100.0);
@@ -401,14 +426,52 @@ static void duckTests()
     };
     double d0, g0; measure (hz::LicenceInfo::pro, 0.0f, d0, g0);
     struct Case { const char* name; int lic; float duck; double expect; };
-    for (auto c : { Case { "Lite (fixed 50 %)", hz::LicenceInfo::none, 0.0f, 0.5 * ar::maxDuckDb },
+    for (auto c : { Case { "Lite (fixed)", hz::LicenceInfo::none, 0.0f, ar::liteDuck / 100.0 * ar::maxDuckDb },
                     Case { "Pro 50 %", hz::LicenceInfo::pro, 50.0f, 0.5 * ar::maxDuckDb },
                     Case { "Pro 100 %", hz::LicenceInfo::pro, 100.0f, ar::maxDuckDb } })
     {
         double d, gp; measure (c.lic, c.duck, d, gp);
         std::printf ("  %-18s during the note %+6.1f dB, in the gap %+6.1f dB (vs duck off)\n", c.name, d - d0, gp - g0);
         check (std::abs ((d0 - d) - c.expect) < 2.5, juce::String (c.name) + ": ducks ~" + juce::String (c.expect, 0) + " dB under the note");
-        check (g0 - gp < 3.0, juce::String (c.name) + ": blooms back in the gap (< 3 dB down)");
+        const double bloom = c.expect > 10.0 ? 4.5 : 3.0;   // full 18 dB releases a little slower (no pumping), still back within the gap
+        check (g0 - gp < bloom, juce::String (c.name) + ": blooms back in the gap (< " + juce::String (bloom, 1) + " dB down)");
+    }
+
+    std::printf ("\n== Drums don't pump the tail (clap every beat @ 124 BPM, wet 20 ms RMS vs duck off) ==\n");
+    {
+        const int n = (int) (6.0 * SR); Buf d (2, n); d.clear();
+        juce::Random r2 (5);
+        const double bt = 60.0 / 124.0;
+        for (int k = 0; k * bt < 6.0; ++k)
+            for (int i = 0, st = (int) (k * bt * SR); i < (int) (0.15 * SR) && st + i < n; ++i)
+            {
+                const float v = 0.6f * (r2.nextFloat() * 2 - 1) * (float) std::exp (-(i / SR) / 0.035);
+                d.setSample (0, st + i, v); d.setSample (1, st + i, v);
+            }
+        auto env = [&] (int lic, float duck)
+        {
+            Rig r (lic, 124.0);
+            setParam (*r.p, "space", ar::plate); setParam (*r.p, "mix", 100.0f); setParam (*r.p, "duck", duck);
+            r.reprepare();
+            const auto o = run (*r.p, d, n, 0, false);
+            std::vector<double> e; const int h = (int) (0.02 * SR);
+            for (int st = (int) (1.0 * SR); st + h <= n; st += h)
+            {
+                double q = 0; for (int c = 0; c < 2; ++c) for (int i = 0; i < h; ++i) q += o.getSample (c, st + i) * o.getSample (c, st + i);
+                e.push_back (10 * std::log10 (q / h + 1e-30));
+            }
+            return e;
+        };
+        const auto off = env (hz::LicenceInfo::pro, 0.0f);
+        for (auto c : { std::pair<const char*, int> { "Lite", hz::LicenceInfo::none }, std::pair<const char*, int> { "Pro 50 %", hz::LicenceInfo::pro } })
+        {
+            const auto on = env (c.second, c.second == hz::LicenceInfo::pro ? 50.0f : 0.0f);
+            double sum = 0, sq = 0; std::vector<double> dev;
+            for (size_t i = 0; i < off.size(); ++i) { const double dv = off[i] - on[i]; dev.push_back (dv); sum += dv; sq += dv * dv; }
+            const double mean = sum / (double) dev.size(), ripple = std::sqrt (juce::jmax (0.0, sq / (double) dev.size() - mean * mean));
+            std::printf ("  %-9s duck depth average %4.1f dB, moves by %4.1f dB (std dev over the groove)\n", c.first, mean, ripple);
+            check (ripple < (c.second == hz::LicenceInfo::pro ? 1.5 : 0.75), juce::String (c.first) + ": the duck moves smoothly with the groove, not on every hit");
+        }
     }
 }
 
@@ -739,7 +802,7 @@ static void snapshots (const juce::File& outDir)
     };
     snap ("ui-1-lite.png", hz::LicenceInfo::none, nullptr, nullptr);
     snap ("ui-2-lite-room-size.png", hz::LicenceInfo::none, nullptr, [] (APP& p) { setParam (p, "space", ar::room); setParam (p, "size", 80.0f); setParam (p, "mix", 40.0f); });
-    snap ("ui-3-lite-pro-panel.png", hz::LicenceInfo::none, "SHIMMER IS A PRO SPACE", nullptr);
+    snap ("ui-3-lite-pro-panel.png", hz::LicenceInfo::none, "SHIMMER IS AN UPGRADE SPACE", nullptr);
     snap ("ui-4-trial.png", hz::LicenceInfo::trial, nullptr, [] (APP& p) { setParam (p, "space", ar::hall); setParam (p, "decay", 5.0f); setParam (p, "predelay", 4.0f); });
     snap ("ui-5-trial-ended.png", hz::LicenceInfo::trialExpired, nullptr, [] (APP& p) { setParam (p, "space", ar::hall); });
     snap ("ui-6-trial-ended-panel.png", hz::LicenceInfo::trialExpired, "", nullptr);
@@ -751,6 +814,20 @@ static void snapshots (const juce::File& outDir)
     snap ("ui-10-pro-freeze.png", hz::LicenceInfo::pro, nullptr, [] (APP& p) { setParam (p, "space", ar::hall); }, [] (APP& p) { setParam (p, "freeze", 1.0f); });
     snap ("ui-11-pro-panel.png", hz::LicenceInfo::pro, "", nullptr);
     snap ("ui-12-quarter-beat.png", hz::LicenceInfo::pro, nullptr, [] (APP& p) { setParam (p, "space", ar::room); setParam (p, "decay", 1.0f); });
+
+    // Licence states (Launch prep renders)
+    auto hallSet = [] (APP& p) { setParam (p, "space", ar::hall); setParam (p, "decay", 5.0f); setParam (p, "predelay", 4.0f); };
+    snap ("licence-1-free.png", hz::LicenceInfo::none, nullptr, nullptr);
+    snap ("licence-2-free-panel.png", hz::LicenceInfo::none, "", nullptr);
+    snap ("licence-3-trial.png", hz::LicenceInfo::trial, nullptr, hallSet);
+    snap ("licence-4-trial-panel.png", hz::LicenceInfo::trial, "", hallSet);
+    snap ("licence-5-trial-ended.png", hz::LicenceInfo::trialExpired, nullptr, nullptr);
+    snap ("licence-6-trial-ended-panel.png", hz::LicenceInfo::trialExpired, "", nullptr);
+    snap ("licence-7-licensed.png", hz::LicenceInfo::pro, nullptr, hallSet);
+    snap ("licence-8-licensed-panel.png", hz::LicenceInfo::pro, "", hallSet);
+    snap ("licence-9-saved-upgrade-settings.png", hz::LicenceInfo::trialExpired, nullptr, [] (APP& p)
+          { setParam (p, "space", ar::shimmer); setParam (p, "decay", 4.0f); setParam (p, "predelay", 3.0f); setParam (p, "duck", 75.0f);
+            setParam (p, "tone", 65.0f); setParam (p, "width", 130.0f); });
 }
 
 int main (int argc, char** argv)
@@ -782,6 +859,12 @@ int main (int argc, char** argv)
             std::printf ("  %-8s wet vs dry %+5.1f dB\n", ar::spaceName (s), 10 * std::log10 (e / dry));
         }
         return 0;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "duck")   // just the ducking tests (quick tuning)
+    {
+        duckTests();
+        std::printf ("\n%d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "calib-table")
     {
@@ -838,7 +921,7 @@ int main (int argc, char** argv)
         if (! arg.containsChar ('=')) continue;
         const auto name = arg.upToFirstOccurrenceOf ("=", false, false);
         const auto info = hz::Licence::verify (arg.fromFirstOccurrenceOf ("=", false, false), "autoreverbpro");
-        const char* kinds[] = { "none", "trial", "pro", "trialExpired", "invalid" };
+        const char* kinds[] = { "none", "trial", "pro", "trialExpired", "invalid", "saveFailed" };
         std::printf ("  key %-14s -> %-12s daysLeft=%d\n", name.toRawUTF8(), kinds[(int) info.kind], info.daysLeft());
         hz::LicenceInfo::Kind want = hz::LicenceInfo::invalid;
         if (name == "pro") want = hz::LicenceInfo::pro;
@@ -848,6 +931,22 @@ int main (int argc, char** argv)
         check (info.kind == want, "key " + name + " -> " + kinds[(int) info.kind]);
     }
 
+    hztest::runLicenceTests<APP> ("autoreverbpro", [] (APP& p) { return p.proUnlocked.load(); });
+    hztest::runSavedSettingsTests<APP> ([] (APP& p)
+    {
+        setParam (p, "space", ar::shimmer); setParam (p, "decay", 4.0f); setParam (p, "predelay", 3.0f);
+        setParam (p, "duck", 75.0f); setParam (p, "tone", 65.0f); setParam (p, "width", 130.0f); setParam (p, "freeze", 1.0f);
+    });
+    {
+        // no licence + saved upgrade settings: flagged, and what runs is still Lite
+        APP p; p.setLicenceInfo ({});
+        setParam (p, "space", ar::shimmer); setParam (p, "decay", 4.0f);
+        const auto e = p.resolve (p.proUnlocked.load(), 124.0);
+        hztest::expect (p.usesUpgradeSettings() && e.space == ar::gate::liteFallbackSpace && e.decayAuto,
+                        "no licence + saved SHIMMER / decay: flagged, plays as Lite (PLATE, AUTO)");
+    }
+    const int licenceResult = hztest::finish();
+
     std::printf ("\n%s: %d failure(s)\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);
-    return failures == 0 ? 0 : 1;
+    return failures == 0 && licenceResult == 0 ? 0 : 1;
 }
