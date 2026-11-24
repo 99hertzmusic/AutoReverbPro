@@ -932,6 +932,7 @@ int main (int argc, char** argv)
     }
 
     hztest::runLicenceTests<APP> ("autoreverbpro", [] (APP& p) { return p.proUnlocked.load(); });
+    hztest::renderLicenceStates<APP> ("autoreverbpro", outDir);
     hztest::runSavedSettingsTests<APP> ([] (APP& p)
     {
         setParam (p, "space", ar::shimmer); setParam (p, "decay", 4.0f); setParam (p, "predelay", 3.0f);
